@@ -1,0 +1,189 @@
+#include "stm32f1xx_hal.h"
+#include <string.h>
+
+void Error_Handler(void);
+
+/*==================== 发送间隔（毫秒）====================*/
+#define SEND_DELAY_MS       200U         /* 每 200ms 发一行，便于观察 */
+
+#define UART_BAUDRATE       115200U
+#define UART_TIMEOUT        100U
+
+/*---------------- SysTick 寄存器（延时用）----------------*/
+#define SYSTICK_CTRL    (*(volatile uint32_t *)0xE000E010)
+#define SYSTICK_LOAD    (*(volatile uint32_t *)0xE000E014)
+#define SYSTICK_VAL     (*(volatile uint32_t *)0xE000E018)
+
+/*---------------- 全局变量 ----------------*/
+static UART_HandleTypeDef huart1;
+static uint8_t g_RxByte   = 0;      /* 中断接收缓冲 */
+static uint8_t g_SendFlag = 1;      /* 1 = 允许发送，0 = 已暂停 */
+
+/*==============================================================================
+ * 系统时钟：HSI 8MHz
+ *============================================================================*/
+void SystemClock_Config(void)
+{
+    RCC->CR |= RCC_CR_HSION;
+    while ((RCC->CR & RCC_CR_HSIRDY) == 0U) { ; }
+    RCC->CFGR &= ~RCC_CFGR_SW;
+    RCC->CFGR |=  RCC_CFGR_SW_HSI;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_HSI) { ; }
+    RCC->CFGR &= ~(RCC_CFGR_HPRE | RCC_CFGR_PPRE1 | RCC_CFGR_PPRE2);
+}
+
+/*==============================================================================
+ * 毫秒延时（SysTick 轮询）
+ *============================================================================*/
+static void Delay_ms(uint32_t ms)
+{
+    while (ms--)
+    {
+        SYSTICK_LOAD = 1000U - 1U;
+        SYSTICK_VAL  = 0U;
+        SYSTICK_CTRL = 0x00000005U;
+        while ((SYSTICK_CTRL & (1U << 16)) == 0U) { ; }
+        SYSTICK_CTRL = 0x00000000U;
+    }
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) { ; }
+}
+
+/*==============================================================================
+ * ★ 中断服务函数（HAL 库必需）
+ *============================================================================*/
+void SysTick_Handler(void)    { HAL_IncTick(); }
+void NMI_Handler(void)        { while (1) { ; } }
+void HardFault_Handler(void)  { while (1) { ; } }
+void MemManage_Handler(void)  { while (1) { ; } }
+void BusFault_Handler(void)   { while (1) { ; } }
+void UsageFault_Handler(void) { while (1) { ; } }
+void SVC_Handler(void)        { ; }
+void DebugMon_Handler(void)   { ; }
+void PendSV_Handler(void)     { ; }
+
+/*==============================================================================
+ * USART1 中断服务函数
+ * 说明：函数名固定，来自启动文件 startup_stm32f103xb.s 的中断向量表。
+ *       USART1 的中断号是 37。
+ *============================================================================*/
+void USART1_IRQHandler(void)
+{
+    /* HAL 的中断处理函数：判断是接收还是发送中断、清标志、调回调 */
+    HAL_UART_IRQHandler(&huart1);
+}
+
+/*==============================================================================
+ * 接收完成回调函数（HAL 弱函数，这里重新实现）
+ *
+ * ★ 中断回调里只做最简单的判断和赋值！
+ *   绝不能调用 HAL_Delay()、printf 等耗时函数。
+ *============================================================================*/
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        /*---- 判断收到的字符 ----*/
+        if (g_RxByte == '#')
+        {
+            g_SendFlag = 0;                 /* 暂停发送 */
+        }
+        else if (g_RxByte == '*')
+        {
+            g_SendFlag = 1;                 /* 继续发送 */
+        }
+
+        /*---- ★ 必须重新启动接收中断！----
+         * HAL_UART_Receive_IT() 是一次性的：收完指定长度就自动关闭中断。
+         * 如果不重新调用，就只能收到第一个字符，后面全收不到了。
+         */
+        HAL_UART_Receive_IT(&huart1, &g_RxByte, 1U);
+    }
+}
+
+/*==============================================================================
+ * USART1 底层初始化（GPIO + 时钟 + **中断**）
+ *============================================================================*/
+void HAL_UART_MspInit(UART_HandleTypeDef *huart)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    if (huart->Instance == USART1)
+    {
+        __HAL_RCC_USART1_CLK_ENABLE();
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+
+        /* PA9 = USART1_TX：复用推挽输出 */
+        GPIO_InitStruct.Pin   = GPIO_PIN_9;
+        GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+        /* PA10 = USART1_RX：上拉输入 */
+        GPIO_InitStruct.Pin  = GPIO_PIN_10;
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+        /*---- ★ 使能 USART1 接收中断（NVIC）----*/
+        HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);   /* 抢占 1，子优先级 0 */
+        HAL_NVIC_EnableIRQ(USART1_IRQn);
+    }
+}
+
+/*==============================================================================
+ * 初始化 USART1
+ *============================================================================*/
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = UART_BAUDRATE;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void UART_SendString(const char *str)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)str, (uint16_t)strlen(str), UART_TIMEOUT);
+}
+
+/*==============================================================================
+ * 主函数
+ *============================================================================*/
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_USART1_UART_Init();
+
+    UART_SendString("\r\n===== TASK 2-1 : USART1 RX INTERRUPT =====\r\n");
+    UART_SendString("USART1  115200bps  8 data bits  1 stop bit  no parity\r\n");
+    UART_SendString("Send '#' to PAUSE, send '*' to RESUME\r\n\r\n");
+
+    /*---- ★ 启动接收中断：每次接收 1 个字节 ----*/
+    HAL_UART_Receive_IT(&huart1, &g_RxByte, 1U);
+
+    while (1)
+    {
+        /* 主循环只管发送，接收完全由中断处理，不用等待 */
+        if (g_SendFlag != 0U)
+        {
+            UART_SendString("hello windows!\r\n");
+        }
+
+        Delay_ms(SEND_DELAY_MS);
+    }
+}
